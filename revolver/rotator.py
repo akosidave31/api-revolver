@@ -5,7 +5,15 @@ BEFORE a key hits its limit, not after it fails.
 revolver v0.2.0: every method runs inside storage.transaction(), so
 concurrent requests never lose usage updates, and usage is charged to
 the key that actually served the request.
+
+revolver v0.2.1: key health. A key is usable only if it is not disabled,
+not cooling down, and under the rotation threshold. Health fields live in
+keys.json next to the usage counters:
+    cooldown_until  unix time; key is skipped until then (429 / 5xx / timeout)
+    disabled        true after 401/403 until `revolver enable`
+    last_error      short reason, shown on the dashboard
 """
+import time
 from datetime import date
 from . import storage
 
@@ -58,6 +66,27 @@ def _over_threshold(key, threshold_pct):
     return _worst_pct(key) >= threshold_pct
 
 
+def _cooldown_left(key, now):
+    return max(0.0, key.get("cooldown_until", 0) - now)
+
+
+def _eligible(key, threshold_pct, now):
+    return (not key.get("disabled", False)
+            and _cooldown_left(key, now) <= 0
+            and not _over_threshold(key, threshold_pct))
+
+
+def _why_not(key, threshold_pct, now):
+    if key.get("disabled", False):
+        return f"disabled ({key.get('last_error', '')})"
+    left = _cooldown_left(key, now)
+    if left > 0:
+        return f"cooling down {left:.0f}s ({key.get('last_error', '')})"
+    if _over_threshold(key, threshold_pct):
+        return f"{_worst_pct(key):.1f}% used"
+    return "ok"
+
+
 def _find(store, key_id):
     for i, k in enumerate(store["keys"]):
         if k["id"] == key_id:
@@ -65,28 +94,41 @@ def _find(store, key_id):
     raise KeyError(f"No key with id {key_id}")
 
 
-def _advance(store, start_idx):
-    """Walk the cylinder looking for a key under threshold. Mutates
+def _exhausted_message(store, now):
+    keys = store["keys"]
+    threshold = store["rotate_threshold_pct"]
+    live = [k for k in keys if not k.get("disabled", False)]
+    if not live:
+        return ("All keys are disabled. See why with: revolver dashboard  "
+                "-- fix, then: revolver enable all")
+    waits = [_cooldown_left(k, now) for k in live
+             if _cooldown_left(k, now) > 0 and not _over_threshold(k, threshold)]
+    if waits:
+        return (f"All usable keys are cooling down after rate limits/errors. "
+                f"Next key free in {min(waits):.0f}s.")
+    return ("All configured keys are past the rotation threshold. "
+            "Add more keys with: revolver setup")
+
+
+def _advance(store, start_idx, now=None):
+    """Walk the cylinder to the next usable key. Mutates
     store["active_index"]; the caller's transaction saves it.
-    Raises AllKeysExhausted if every key is past threshold."""
+    Raises AllKeysExhausted if no key is usable."""
+    now = time.time() if now is None else now
     keys = store["keys"]
     threshold = store["rotate_threshold_pct"]
     n = len(keys)
     for step in range(1, n + 1):
         candidate = (start_idx + step) % n
         _maybe_reset(keys[candidate])
-        if not _over_threshold(keys[candidate], threshold):
+        if _eligible(keys[candidate], threshold, now):
             store["active_index"] = candidate
-            prev = keys[start_idx]
-            print(f"[revolver] switched to key '{keys[candidate]['name']}' "
-                  f"(was at {_worst_pct(prev):.1f}% on previous key "
-                  f"-- tokens {_pct_used(prev):.1f}%, "
-                  f"requests {_request_pct_used(prev):.1f}%)")
+            if candidate != start_idx:
+                prev = keys[start_idx]
+                print(f"[revolver] switched to key '{keys[candidate]['name']}' "
+                      f"(previous '{prev['name']}': {_why_not(prev, threshold, now)})")
             return candidate
-    raise AllKeysExhausted(
-        "All configured keys are past the rotation threshold. "
-        "Add more keys with: revolver setup"
-    )
+    raise AllKeysExhausted(_exhausted_message(store, now))
 
 
 class Rotator:
@@ -99,16 +141,20 @@ class Rotator:
                 _maybe_reset(k)
             self.store = store  # snapshot, for display only
 
+    def key_count(self):
+        return len(self.store["keys"])
+
     def acquire_key(self, auto_rotate=True):
         """Return a copy of the key that should serve the next request,
-        rotating proactively if the current one is past the threshold.
-        Pass its ["id"] back to record_usage() / force_rotate()."""
+        moving on if the current one is disabled, cooling down, or past
+        the threshold. Pass its ["id"] back to record_usage() / mark_*()."""
         with storage.transaction() as store:
             keys = store["keys"]
             idx = store["active_index"] % len(keys)
             _maybe_reset(keys[idx])
-            if auto_rotate and _over_threshold(keys[idx], store["rotate_threshold_pct"]):
-                idx = _advance(store, idx)
+            now = time.time()
+            if auto_rotate and not _eligible(keys[idx], store["rotate_threshold_pct"], now):
+                idx = _advance(store, idx, now)
             self.store = store
             return dict(keys[idx])
 
@@ -116,10 +162,9 @@ class Rotator:
     active_key = acquire_key
 
     def record_usage(self, tokens_used, key_id=None):
-        """Call after every API response with the real token count
-        (prompt + completion). Also counts as one request.
-        key_id: the key that served the call (recommended). If omitted,
-        charges the active key, like v0.1."""
+        """Call after every successful API response with the real token
+        count (prompt + completion). Also counts as one request.
+        key_id: the key that served the call (recommended)."""
         with storage.transaction() as store:
             keys = store["keys"]
             active_idx = store["active_index"] % len(keys)
@@ -128,9 +173,8 @@ class Rotator:
             key["tokens_used"] += tokens_used
             key["requests_used"] = key.get("requests_used", 0) + 1
 
-            # Proactively rotate so the *next* call already uses a fresh key.
-            # Only if this key is still the active one: another request may
-            # have rotated already. If every key is spent, don't fail THIS
+            # Proactively rotate so the *next* call already uses a fresh key,
+            # only if this key is still the active one. Never fail THIS
             # (successful) call -- the next acquire_key() raises instead.
             if idx == active_idx and _over_threshold(key, store["rotate_threshold_pct"]):
                 try:
@@ -139,8 +183,48 @@ class Rotator:
                     pass
             self.store = store
 
+    def _mark(self, key_id, reason, cooldown_s=None, disable=False):
+        with storage.transaction() as store:
+            keys = store["keys"]
+            idx, key = _find(store, key_id)
+            now = time.time()
+            key["last_error"] = reason[:160]
+            if disable:
+                key["disabled"] = True
+            if cooldown_s is not None:
+                key["cooldown_until"] = now + cooldown_s
+            # move the cylinder off this key if it was the active one
+            if idx == store["active_index"] % len(keys):
+                try:
+                    _advance(store, idx, now)
+                except AllKeysExhausted:
+                    pass
+            self.store = store
+
+    def mark_cooldown(self, key_id, seconds, reason):
+        """Skip this key for `seconds` (rate limit, server error, timeout)."""
+        self._mark(key_id, reason, cooldown_s=seconds)
+
+    def mark_disabled(self, key_id, reason):
+        """Take this key out of rotation until `revolver enable`."""
+        self._mark(key_id, reason, disable=True)
+
+    def enable(self, key_id=None):
+        """Clear disabled/cooldown/last_error for one key, or all if None.
+        Returns the names of the keys touched."""
+        with storage.transaction() as store:
+            touched = []
+            for k in store["keys"]:
+                if key_id is None or k["id"] == key_id:
+                    k["disabled"] = False
+                    k["cooldown_until"] = 0
+                    k["last_error"] = ""
+                    touched.append(k["name"])
+            self.store = store
+            return touched
+
     def force_rotate(self, from_key_id=None):
-        """Rotate away from a key the provider rejected (e.g. 429).
+        """Rotate away from a key the provider rejected.
         from_key_id: the key that failed. If the active key is already a
         different one (another request rotated first), nothing happens."""
         with storage.transaction() as store:
@@ -162,6 +246,8 @@ class Rotator:
         with storage.transaction() as store:
             keys = store["keys"]
             active_idx = store["active_index"] % len(keys)
+            threshold = store["rotate_threshold_pct"]
+            now = time.time()
             rows = []
             for i, k in enumerate(keys):
                 _maybe_reset(k)
@@ -172,6 +258,7 @@ class Rotator:
                     "id": k["id"],
                     "name": k["name"],
                     "provider": k["provider"],
+                    "model": k.get("model", ""),
                     "used": k["tokens_used"],
                     "limit": k["token_limit"],
                     "remaining": max(k["token_limit"] - k["tokens_used"], 0),
@@ -181,6 +268,7 @@ class Rotator:
                     "req_remaining": max(req_limit - req_used, 0),
                     "req_pct": _request_pct_used(k),
                     "period": k["period"],
+                    "status": _why_not(k, threshold, now),
                 })
             self.store = store
             return rows

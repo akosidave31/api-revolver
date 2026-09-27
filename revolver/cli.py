@@ -1,8 +1,9 @@
 """
 Entry point. Usage:
   revolver setup            interactive key entry (nano-style)
-  revolver dashboard        show tokens used/left per key
+  revolver dashboard        show tokens used/left and health per key
   revolver threshold 85     set proactive rotation threshold (% used)
+  revolver enable <id|all>  put disabled / cooling-down keys back in rotation
   revolver run "prompt"     send a prompt through the active key
 """
 import sys
@@ -22,7 +23,7 @@ def cmd_dashboard():
     print(f"\n=== API Revolver Dashboard (rotate at {threshold}%) ===\n")
     for row in rows:
         marker = "->" if row["active"] else "  "
-        print(f"{marker} #{row['id']} {row['name']:<14} [{row['provider']}]")
+        print(f"{marker} #{row['id']} {row['name']:<14} [{row['provider']}] {row.get('model', '')}")
         print(f"     tokens   [{_bar(row['pct'])}] {row['pct']:5.1f}%  "
               f"used {row['used']}/{row['limit']}  "
               f"remaining {row['remaining']} ({row['period']})")
@@ -30,6 +31,8 @@ def cmd_dashboard():
               f"{row.get('req_pct', 0):5.1f}%  "
               f"used {row.get('req_used', 0)}/{row.get('req_limit', 0)}  "
               f"remaining {row.get('req_remaining', 0)}")
+        if row.get("status", "ok") != "ok":
+            print(f"     status   {row['status']}")
     print()
 
 
@@ -44,13 +47,36 @@ def cmd_threshold(args):
     print(f"Rotation threshold set to {pct}%")
 
 
+def cmd_enable(args):
+    from .rotator import Rotator
+    if not args:
+        print("Usage: revolver enable <id|all>")
+        return
+    r = Rotator()
+    try:
+        key_id = None if args[0] == "all" else int(args[0])
+    except ValueError:
+        print("Usage: revolver enable <id|all>")
+        return
+    touched = r.enable(key_id)
+    if touched:
+        print(f"Enabled: {', '.join(touched)}")
+    else:
+        print(f"No key with id {args[0]}")
+
+
 def cmd_run(args):
-    from .client import chat
+    from .client import chat, RevolverError
+    from .rotator import AllKeysExhausted, NoKeysAvailable
     if not args:
         print('Usage: revolver run "your prompt here"')
         return
     prompt = " ".join(args)
-    result = chat(prompt)
+    try:
+        result = chat(prompt)
+    except (RevolverError, AllKeysExhausted, NoKeysAvailable) as e:
+        print(f"[revolver] error: {e}")
+        sys.exit(1)
     print(f"\n[key used: {result['key_used']}, tokens this call: {result['tokens_used_this_call']}]\n")
     print(result["text"])
 
@@ -70,6 +96,8 @@ def main():
         cmd_dashboard()
     elif cmd == "threshold":
         cmd_threshold(rest)
+    elif cmd == "enable":
+        cmd_enable(rest)
     elif cmd == "run":
         cmd_run(rest)
     else:
