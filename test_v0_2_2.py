@@ -81,6 +81,8 @@ def main():
         # deliberately wrong local request_limit, header should fix it
         storage.add_key(store, "groq", n, n.upper(), "fake-model", 100000, request_limit=5000)
     print(f"temp store: {storage.STORE_PATH}\n")
+    with storage.transaction() as _s:   # these cases assume k1 is tried first
+        _s["selector"] = "sequential"
 
     print("1. duration parser")
     for raw, want in [("1m26.4s", 86.4), ("134ms", 0.134), ("7.66s", 7.66),

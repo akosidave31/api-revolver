@@ -67,6 +67,8 @@ def main():
     for n in ("k1", "k2"):
         storage.add_key(store, "groq", n, n.upper(), "fake-model", 100000)
     print(f"temp store: {storage.STORE_PATH}\n")
+    with storage.transaction() as _s:   # these cases assume k1 is tried first
+        _s["selector"] = "sequential"
     now = time.time()
 
     print("1. refill math")

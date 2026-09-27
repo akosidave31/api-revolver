@@ -181,6 +181,47 @@ def _ratelimits(resp):
     return {k: v for k, v in rl.items() if v is not None}
 
 
+# ---- revolver v0.2.5: how long to cool a key after a 429 ----
+TRANSIENT_429_S = 10
+_TRY_AGAIN = re.compile(r"try again in\s+([0-9hms.]+)", re.IGNORECASE)
+
+
+def _clamp(secs):
+    return min(max(float(secs), 1.0), 3600.0)
+
+
+def _cooldown_for_429(resp):
+    """Best-evidence cooldown for a 429 (see apply_v0_2_5.py docstring)."""
+    # 1. provider told us exactly
+    if resp.headers.get("retry-after") is not None:
+        return _retry_after_seconds(resp)
+
+    # 2. Groq puts the wait in the message for daily-token (TPD) limits
+    m = _TRY_AGAIN.search(resp.text or "")
+    if m:
+        secs = _parse_duration(m.group(1))
+        if secs:
+            return _clamp(secs)
+
+    # 3./4. rate-limit headers
+    rl = _ratelimits(resp)
+    if rl:
+        waits = []
+        if rl.get("req_remaining") == 0:
+            r = _parse_duration(resp.headers.get("x-ratelimit-reset-requests"))
+            if r:
+                waits.append(r)
+        tok_lim, tok_rem = rl.get("tok_limit"), rl.get("tok_remaining")
+        if tok_lim and tok_rem is not None and tok_rem < 0.10 * tok_lim and rl.get("tok_reset_s"):
+            waits.append(rl["tok_reset_s"])
+        if waits:
+            return _clamp(max(waits))
+        return float(TRANSIENT_429_S)   # quota left: a spike on their side
+
+    # 5. no information
+    return float(DEFAULT_RETRY_AFTER_S)
+
+
 def _send(key, prompt, system, max_tokens, temperature):
     provider = key["provider"]
     # Gemini uses its own API format.
@@ -246,9 +287,10 @@ def chat(
 
         # Rate limit / quota reached.
         if code == 429:
-            secs = _retry_after_seconds(resp)
-            print(f"[revolver] 429 from '{name}', cooling down {secs:.0f}s.")
-            rotator.mark_cooldown(key["id"], secs, "429 rate limited")
+            secs = _cooldown_for_429(resp)
+            why = _short(resp)[:150]
+            print(f"[revolver] 429 from '{name}', cooling down {secs:.0f}s: {why}")
+            rotator.mark_cooldown(key["id"], secs, f"429 {why}")
             rotator.sync_limits(key["id"], _ratelimits(resp))
             continue
 

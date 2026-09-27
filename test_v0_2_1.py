@@ -93,6 +93,8 @@ def main():
     for n in ("k1", "k2", "k3"):
         storage.add_key(store, "groq", n, n.upper(), "fake-model", 100000)
     print(f"temp store: {storage.STORE_PATH}\n")
+    with storage.transaction() as _s:   # these cases assume k1 is tried first
+        _s["selector"] = "sequential"
 
     print("1. 429 -> cooldown by Retry-After, next key serves")
     reset(K1=[FakeResp(429, headers={"retry-after": "5"})], K2=[ok()])
