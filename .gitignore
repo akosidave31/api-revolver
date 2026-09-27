@@ -4,3 +4,5 @@ __pycache__/
 *.bak.*
 keys.json
 .env
+*.v0.1.bak
+apply_v0_2_0.py
