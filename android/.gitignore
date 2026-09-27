@@ -1,0 +1,7 @@
+.gradle/
+build/
+app/build/
+local.properties
+keystore.jks
+# copied from ../revolver by the CI build
+app/src/main/python/revolver/

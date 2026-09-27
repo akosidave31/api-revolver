@@ -1,0 +1,73 @@
+# revolver v0.4.0: build the Phone A app and publish it as release "apk-latest"
+name: android-apk
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "revolver/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5      # Chaquopy needs a matching build Python
+        with:
+          python-version: "3.13"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Bundle the revolver package into the app
+        run: |
+          rm -rf android/app/src/main/python/revolver
+          cp -r revolver android/app/src/main/python/revolver
+          find android/app/src/main/python -name "*.bak" -delete
+          ls android/app/src/main/python/revolver
+
+      - name: Optional stable signing key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > android/keystore.jks
+            echo "using stable signing key"
+          else
+            echo "no KEYSTORE_B64 secret: using a fresh debug key"
+          fi
+
+      - name: Build APK
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KS_ALIAS: revolver
+        run: gradle -p android assembleDebug --stacktrace
+
+      - name: Publish as release apk-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk revolver-server.apk
+          gh release delete apk-latest -y --cleanup-tag || true
+          gh release create apk-latest revolver-server.apk \
+            --title "Revolver Server APK (latest build)" \
+            --notes "Built from ${GITHUB_SHA::7}. Install on Phone A." \
+            --prerelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: revolver-server-apk
+          path: revolver-server.apk
