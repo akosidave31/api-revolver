@@ -12,6 +12,9 @@ keys.json next to the usage counters:
     cooldown_until  unix time; key is skipped until then (429 / 5xx / timeout)
     disabled        true after 401/403 until `revolver enable`
     last_error      short reason, shown on the dashboard
+
+revolver v0.2.2: sync_limits() applies the provider's x-ratelimit-*
+headers (real request counts, tokens-per-minute budget).
 """
 import time
 from datetime import date
@@ -223,6 +226,43 @@ class Rotator:
             self.store = store
             return touched
 
+    def sync_limits(self, key_id, rl, reserve_tokens=0):
+        """revolver v0.2.2: apply the provider's x-ratelimit-* numbers.
+        rl: dict from client._ratelimits(). reserve_tokens: tokens the next
+        call may need; if the key's per-minute budget is below that, it
+        cools down until the budget refills and the next key takes over."""
+        if not rl:
+            return
+        with storage.transaction() as store:
+            keys = store["keys"]
+            idx, key = _find(store, key_id)
+            now = time.time()
+
+            if "req_limit" in rl:
+                key["request_limit"] = rl["req_limit"]
+                if "req_remaining" in rl:
+                    key["requests_used"] = max(0, rl["req_limit"] - rl["req_remaining"])
+            if "tok_limit" in rl:
+                key["tpm_limit"] = rl["tok_limit"]
+            if "tok_remaining" in rl:
+                key["tpm_remaining"] = rl["tok_remaining"]
+            reset_s = rl.get("tok_reset_s")
+            if reset_s is not None:
+                key["tpm_reset_at"] = now + reset_s
+
+            low = ("tok_remaining" in rl and reserve_tokens > 0
+                   and rl["tok_remaining"] < reserve_tokens and reset_s)
+            if low:
+                key["cooldown_until"] = max(key.get("cooldown_until", 0), now + reset_s)
+                key["last_error"] = (f"TPM low ({rl['tok_remaining']}/"
+                                     f"{rl.get('tok_limit', '?')}, need {reserve_tokens})")
+                if idx == store["active_index"] % len(keys):
+                    try:
+                        _advance(store, idx, now)
+                    except AllKeysExhausted:
+                        pass
+            self.store = store
+
     def force_rotate(self, from_key_id=None):
         """Rotate away from a key the provider rejected.
         from_key_id: the key that failed. If the active key is already a
@@ -269,6 +309,8 @@ class Rotator:
                     "req_pct": _request_pct_used(k),
                     "period": k["period"],
                     "status": _why_not(k, threshold, now),
+                    "tpm_limit": k.get("tpm_limit"),
+                    "tpm_remaining": k.get("tpm_remaining"),
                 })
             self.store = store
             return rows

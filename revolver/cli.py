@@ -31,6 +31,9 @@ def cmd_dashboard():
               f"{row.get('req_pct', 0):5.1f}%  "
               f"used {row.get('req_used', 0)}/{row.get('req_limit', 0)}  "
               f"remaining {row.get('req_remaining', 0)}")
+        if row.get("tpm_limit"):
+            print(f"     tpm      limit {row['tpm_limit']}/min  "
+                  f"last seen {row.get('tpm_remaining', '?')} left")
         if row.get("status", "ok") != "ok":
             print(f"     status   {row['status']}")
     print()

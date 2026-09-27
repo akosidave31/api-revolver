@@ -6,6 +6,7 @@ pick active key -> call -> record usage -> rotate if needed
 -> retry once on 429.
 """
 
+import re
 import requests
 from .rotator import Rotator, AllKeysExhausted
 
@@ -138,6 +139,48 @@ def _is_bad_key(key, resp):
     return False
 
 
+# ---- revolver v0.2.2: provider rate-limit headers ----
+_DURATION = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
+_UNIT_S = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def _parse_duration(value):
+    """'1m26.4s' -> 86.4, '134ms' -> 0.134, '7' -> 7.0, junk -> None."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    parts = _DURATION.findall(value)
+    if not parts:
+        return None
+    return sum(float(n) * _UNIT_S[u] for n, u in parts)
+
+
+def _to_int(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ratelimits(resp):
+    """Read x-ratelimit-* headers. Returns only the fields present,
+    so providers without them give {} and nothing is changed.
+    Groq: *-requests = per day, *-tokens = per minute."""
+    h = resp.headers
+    rl = {
+        "req_limit": _to_int(h.get("x-ratelimit-limit-requests")),
+        "req_remaining": _to_int(h.get("x-ratelimit-remaining-requests")),
+        "tok_limit": _to_int(h.get("x-ratelimit-limit-tokens")),
+        "tok_remaining": _to_int(h.get("x-ratelimit-remaining-tokens")),
+        "tok_reset_s": _parse_duration(h.get("x-ratelimit-reset-tokens")),
+    }
+    return {k: v for k, v in rl.items() if v is not None}
+
+
 def _send(key, prompt, system, max_tokens, temperature):
     provider = key["provider"]
     # Gemini uses its own API format.
@@ -206,6 +249,7 @@ def chat(
             secs = _retry_after_seconds(resp)
             print(f"[revolver] 429 from '{name}', cooling down {secs:.0f}s.")
             rotator.mark_cooldown(key["id"], secs, "429 rate limited")
+            rotator.sync_limits(key["id"], _ratelimits(resp))
             continue
 
         # Provider-side outage.
@@ -235,6 +279,8 @@ def chat(
 
         # Record real usage.
         rotator.record_usage(total_tokens, key_id=key["id"])
+        # provider's own numbers override our local estimate (v0.2.2)
+        rotator.sync_limits(key["id"], _ratelimits(resp), reserve_tokens=max_tokens)
 
         return {
             "text": text,
