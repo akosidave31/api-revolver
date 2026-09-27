@@ -15,6 +15,10 @@ keys.json next to the usage counters:
 
 revolver v0.2.2: sync_limits() applies the provider's x-ratelimit-*
 headers (real request counts, tokens-per-minute budget).
+
+revolver v0.2.3: header-synced daily request counts refill over time
+(req_seen_at), so a benched key comes back as soon as the provider
+has refilled it instead of waiting for local midnight.
 """
 import time
 from datetime import date
@@ -42,7 +46,9 @@ def _period_expired(key):
 def _maybe_reset(key):
     if _period_expired(key):
         key["tokens_used"] = 0
-        key["requests_used"] = 0
+        if "req_seen_at" not in key:
+            # provider-synced counts refill on their own (v0.2.3)
+            key["requests_used"] = 0
         key["period_start"] = str(date.today())
 
 
@@ -52,11 +58,23 @@ def _pct_used(key):
     return 100.0 * key["tokens_used"] / key["token_limit"]
 
 
+def _requests_used(key, now=None):
+    """Requests used right now. For header-synced daily keys, the
+    provider refills limit/86400 per second since the last sync."""
+    used = key.get("requests_used", 0)
+    seen = key.get("req_seen_at")
+    limit = key.get("request_limit", 0)
+    if seen and limit > 0 and key.get("period") == "daily":
+        now = time.time() if now is None else now
+        used = max(0.0, used - (now - seen) * limit / 86400.0)
+    return used
+
+
 def _request_pct_used(key):
     limit = key.get("request_limit", 0)
     if limit <= 0:
         return 0.0
-    return 100.0 * key.get("requests_used", 0) / limit
+    return 100.0 * _requests_used(key) / limit
 
 
 def _worst_pct(key):
@@ -242,6 +260,7 @@ class Rotator:
                 key["request_limit"] = rl["req_limit"]
                 if "req_remaining" in rl:
                     key["requests_used"] = max(0, rl["req_limit"] - rl["req_remaining"])
+                    key["req_seen_at"] = now
             if "tok_limit" in rl:
                 key["tpm_limit"] = rl["tok_limit"]
             if "tok_remaining" in rl:
@@ -292,7 +311,7 @@ class Rotator:
             for i, k in enumerate(keys):
                 _maybe_reset(k)
                 req_limit = k.get("request_limit", 0)
-                req_used = k.get("requests_used", 0)
+                req_used = round(_requests_used(k, now))
                 rows.append({
                     "active": i == active_idx,
                     "id": k["id"],
