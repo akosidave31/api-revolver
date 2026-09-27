@@ -5,6 +5,8 @@ Entry point. Usage:
   revolver threshold 85     set proactive rotation threshold (% used)
   revolver enable <id|all>  put disabled / cooling-down keys back in rotation
   revolver selector [name]  show or set key selector: weighted | sequential
+  revolver serve [port]     web server for Phone A: chat page + dashboard (revolver v0.3.0)
+  revolver token [new]      show (or regenerate) the server token
   revolver run "prompt"     send a prompt through the active key
 """
 import sys
@@ -50,6 +52,24 @@ def cmd_threshold(args):
     r = Rotator()
     r.set_threshold(pct)
     print(f"Rotation threshold set to {pct}%")
+
+
+def cmd_serve(args):
+    from .server import serve
+    try:
+        port = int(args[0]) if args else 8080
+    except ValueError:
+        print("Usage: revolver serve [port]")
+        return
+    sys.exit(serve(port=port) or 0)
+
+
+def cmd_token(args):
+    from .server import load_token
+    regenerate = bool(args) and args[0] == "new"
+    print(load_token(regenerate=regenerate))
+    if regenerate:
+        print("(new token: re-enter it on each browser)")
 
 
 def cmd_selector(args):
@@ -119,6 +139,10 @@ def main():
         cmd_enable(rest)
     elif cmd == "selector":
         cmd_selector(rest)
+    elif cmd == "serve":
+        cmd_serve(rest)
+    elif cmd == "token":
+        cmd_token(rest)
     elif cmd == "run":
         cmd_run(rest)
     else:
