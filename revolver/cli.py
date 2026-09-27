@@ -4,6 +4,7 @@ Entry point. Usage:
   revolver dashboard        show tokens used/left and health per key
   revolver threshold 85     set proactive rotation threshold (% used)
   revolver enable <id|all>  put disabled / cooling-down keys back in rotation
+  revolver selector [name]  show or set key selector: weighted | sequential
   revolver run "prompt"     send a prompt through the active key
 """
 import sys
@@ -20,7 +21,8 @@ def cmd_dashboard():
     rows = r.dashboard_rows()
     threshold = r.store["rotate_threshold_pct"]
 
-    print(f"\n=== API Revolver Dashboard (rotate at {threshold}%) ===\n")
+    selector = r.store.get("selector", "weighted")
+    print(f"\n=== API Revolver Dashboard (rotate at {threshold}%, selector: {selector}) ===\n")
     for row in rows:
         marker = "->" if row["active"] else "  "
         print(f"{marker} #{row['id']} {row['name']:<14} [{row['provider']}] {row.get('model', '')}")
@@ -48,6 +50,20 @@ def cmd_threshold(args):
     r = Rotator()
     r.set_threshold(pct)
     print(f"Rotation threshold set to {pct}%")
+
+
+def cmd_selector(args):
+    from .rotator import Rotator, SELECTORS
+    r = Rotator()
+    if not args:
+        print(f"selector: {r.store.get('selector', 'weighted')}  (options: {', '.join(SELECTORS)})")
+        return
+    try:
+        r.set_selector(args[0])
+    except ValueError as e:
+        print(e)
+        return
+    print(f"selector set to {args[0]}")
 
 
 def cmd_enable(args):
@@ -101,6 +117,8 @@ def main():
         cmd_threshold(rest)
     elif cmd == "enable":
         cmd_enable(rest)
+    elif cmd == "selector":
+        cmd_selector(rest)
     elif cmd == "run":
         cmd_run(rest)
     else:

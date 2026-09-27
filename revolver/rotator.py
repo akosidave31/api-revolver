@@ -19,7 +19,12 @@ headers (real request counts, tokens-per-minute budget).
 revolver v0.2.3: header-synced daily request counts refill over time
 (req_seen_at), so a benched key comes back as soon as the provider
 has refilled it instead of waiting for local midnight.
+
+revolver v0.2.4: default selector is "weighted" (pacing.py): random
+pick among usable keys, weighted by headroom. store["selector"] =
+"sequential" restores the v0.2.3 one-key-at-a-time behavior.
 """
+import random
 import time
 from datetime import date
 from . import storage
@@ -152,6 +157,42 @@ def _advance(store, start_idx, now=None):
     raise AllKeysExhausted(_exhausted_message(store, now))
 
 
+SELECTORS = ("weighted", "sequential")
+DEFAULT_SELECTOR = "weighted"
+CUTOFF_FRAC = 0.10      # skip keys with <= 10% headroom while better ones exist
+DANGER_FRAC = 0.20      # below 20% headroom a key gets...
+DANGER_PENALTY = 0.15   # ...only 15% of its normal weight
+
+
+def _frac_left(key, now):
+    """Headroom 0..1 on the scarcest dimension the revolver knows about."""
+    fracs = [1.0 - _request_pct_used(key) / 100.0,
+             1.0 - _pct_used(key) / 100.0]
+    lim = key.get("tpm_limit")
+    if lim and now < key.get("tpm_reset_at", 0):
+        fracs.append(key.get("tpm_remaining", lim) / lim)
+    return max(0.0, min(fracs))
+
+
+def _pick_weighted(store, now):
+    """pacing.py selector: random pick among usable keys, weighted by
+    headroom, with a danger penalty. Sets store["active_index"]."""
+    keys = store["keys"]
+    threshold = store["rotate_threshold_pct"]
+    cands = []
+    for i, k in enumerate(keys):
+        _maybe_reset(k)
+        if _eligible(k, threshold, now):
+            cands.append((i, _frac_left(k, now)))
+    if not cands:
+        raise AllKeysExhausted(_exhausted_message(store, now))
+    pool = [c for c in cands if c[1] > CUTOFF_FRAC] or [max(cands, key=lambda c: c[1])]
+    weights = [max(f, 1e-6) * (DANGER_PENALTY if f < DANGER_FRAC else 1.0) for _, f in pool]
+    idx = random.choices([i for i, _ in pool], weights=weights, k=1)[0]
+    store["active_index"] = idx
+    return idx
+
+
 class Rotator:
     def __init__(self):
         with storage.transaction() as store:
@@ -174,7 +215,10 @@ class Rotator:
             idx = store["active_index"] % len(keys)
             _maybe_reset(keys[idx])
             now = time.time()
-            if auto_rotate and not _eligible(keys[idx], store["rotate_threshold_pct"], now):
+            selector = store.get("selector", DEFAULT_SELECTOR)
+            if auto_rotate and selector == "weighted":
+                idx = _pick_weighted(store, now)
+            elif auto_rotate and not _eligible(keys[idx], store["rotate_threshold_pct"], now):
                 idx = _advance(store, idx, now)
             self.store = store
             return dict(keys[idx])
@@ -295,6 +339,13 @@ class Rotator:
             new_idx = _advance(store, idx)
             self.store = store
             return new_idx
+
+    def set_selector(self, name):
+        if name not in SELECTORS:
+            raise ValueError(f"selector must be one of {SELECTORS}")
+        with storage.transaction() as store:
+            store["selector"] = name
+            self.store = store
 
     def set_threshold(self, pct):
         with storage.transaction() as store:
